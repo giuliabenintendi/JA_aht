@@ -1,0 +1,614 @@
+'''
+Script for training a PPO ego agent against a *population* of homogeneous, RL-based partner agents. 
+Does not support training against heuristic partner agents. 
+**Warning**: modify with caution, as this script is used as the main script for ego training throughout the project.
+
+If running the script directly, please specify a partner agent config at 
+`ego_agent_training/configs/algorithm/ppo_ego/_base_.yaml`.
+
+Command to run PPO ego training:
+python ego_agent_training/run.py algorithm=ppo_ego/lbf task=lbf label=test_ppo_ego
+
+Suggested debug command:
+python ego_agent_training/run.py algorithm=ppo_ego/lbf task=lbf logger.mode=disabled label=debug algorithm.TOTAL_TIMESTEPS=1e5
+'''
+import shutil
+import time
+import logging
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import hydra
+from flax.training.train_state import TrainState
+
+from agents.population_interface import AgentPopulation
+from agents.ja_utils import jsd_divergence, inferred_attention
+from common.run_episodes import run_episodes
+from common.plot_utils import get_stats, get_metric_names
+from common.save_load_utils import save_train_run
+from ego_agent_training.utils import initialize_ego_agent
+from envs import make_env
+from envs.log_wrapper import LogWrapper
+from common.agent_loader_from_config import initialize_rl_agent_from_config
+from marl.ppo_utils import _create_minibatches, Transition, unbatchify
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+def train_ppo_ego_agent(config, env, train_rng, 
+                        ego_policy, init_ego_params, n_ego_train_seeds,
+                        partner_population: AgentPopulation,
+                        partner_params
+                        ):
+    '''
+    Train PPO ego agent using the given partner checkpoints and initial ego parameters.
+
+    Args:
+        config: dict, config for the training
+        env: gymnasium environment
+        train_rng: jax.random.PRNGKey, random key for training
+        ego_policy: AgentPolicy, policy for the ego agent
+        init_ego_params: dict, initial parameters for the ego agent
+        n_ego_train_seeds: int, number of ego training seeds
+        partner_population: AgentPopulation, population of partner agents
+        partner_params: pytree of parameters for the population of agents of shape (pop_size, ...).
+    '''
+    # Get partner parameters from the population
+    num_total_partners = partner_population.pop_size
+
+    # ------------------------------
+    # Build the PPO training function
+    # ------------------------------
+    def make_ppo_train(config):
+        '''agent 0 is the ego agent while agent 1 is the confederate'''
+        num_agents = env.num_agents
+        assert num_agents == 2, "This snippet assumes exactly 2 agents."
+
+        config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+        config["NUM_UNCONTROLLED_ACTORS"] = config["NUM_ENVS"] # assumption: we control 1 agent
+        config["NUM_CONTROLLED_ACTORS"] = config["NUM_ENVS"] # assumption: we control 1 agent
+        config["NUM_UPDATES"] = config["TOTAL_TIMESTEPS"] // config["ROLLOUT_LENGTH"] // config["NUM_ENVS"]
+
+        config["NUM_ACTIONS"] = env.action_space(env.agents[0]).n
+        assert config["NUM_CONTROLLED_ACTORS"] % config["NUM_MINIBATCHES"] == 0, "NUM_CONTROLLED_ACTORS must be divisible by NUM_MINIBATCHES"
+        assert config["NUM_CONTROLLED_ACTORS"] >= config["NUM_MINIBATCHES"], "NUM_CONTROLLED_ACTORS must be >= NUM_MINIBATCHES"
+
+        def linear_schedule(count):
+            frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
+            return config["LR"] * frac
+
+        def train(rng):
+            if config["ANNEAL_LR"]:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                )
+            else:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(config["LR"], eps=1e-5),
+                )
+
+            train_state = TrainState.create(
+                apply_fn=ego_policy.network.apply,
+                params=init_ego_params,
+                tx=tx,
+            )
+            #  Init ego and partner hstates
+            init_ego_hstate = ego_policy.init_hstate(config["NUM_CONTROLLED_ACTORS"])
+            init_partner_hstate = partner_population.init_hstate(config["NUM_UNCONTROLLED_ACTORS"])
+            
+            # --- Joint Attention config ---
+            use_ja = config.get("USE_JA", False)
+            ja_beta_max = config.get("JA_BETA_MAX", 0.1)
+            ja_warmup_steps = config.get("JA_WARMUP_STEPS", 50)
+            # Grid dimensions for inferred partner attention (only needed when USE_JA=True)
+            ja_obs_height = config.get("JA_OBS_HEIGHT", 0)
+            ja_obs_width = config.get("JA_OBS_WIDTH", 0)
+
+            def _env_step(runner_state, unused):
+                """
+                One step of the environment:
+                1. Get observations, sample actions from all agents
+                2. Step environment using sampled actions
+                3. (If USE_JA) Compute JA intrinsic reward and augment env reward
+                4. Return state, reward, ...
+                """
+                train_state, env_state, prev_obs, prev_done, ego_hstate, partner_hstate, partner_indices, ja_beta, rng = runner_state
+                rng, actor_rng, partner_rng, step_rng = jax.random.split(rng, 4)
+
+                 # Get available actions for agent 0 from environment state
+                avail_actions = jax.vmap(env.get_avail_actions)(env_state.env_state)
+                avail_actions = jax.lax.stop_gradient(avail_actions)
+                avail_actions_0 = avail_actions["agent_0"].astype(jnp.float32)
+                avail_actions_1 = avail_actions["agent_1"].astype(jnp.float32)
+
+                # Conditionally resample partners based on prev_done["__all__"]
+                needs_resample = prev_done["__all__"] # shape (NUM_ENVS,) bool
+                sampled_indices_all = partner_population.sample_agent_indices(config["NUM_CONTROLLED_ACTORS"], partner_rng)
+
+                # Determine final indices based on whether resampling was needed for each env
+                updated_partner_indices = jnp.where(
+                    needs_resample,         # Mask shape (NUM_ENVS,)
+                    sampled_indices_all,    # Use newly sampled index if True
+                    partner_indices         # Else, keep index from previous step
+                )
+
+                # Note that we do not need to reset the hiden states for both the ego and partner agents
+                # as the recurrent states are automatically reset when done is True, and the partner indices are only reset when done is True.
+
+                # Agent_0 (ego) action, value, log_prob
+                ego_output = ego_policy.get_action_value_policy(
+                    params=train_state.params,
+                    obs=prev_obs["agent_0"].reshape(1, config["NUM_CONTROLLED_ACTORS"], -1),
+                    done=prev_done["agent_0"].reshape(1, config["NUM_CONTROLLED_ACTORS"]),
+                    avail_actions=avail_actions_0,
+                    hstate=ego_hstate,
+                    rng=actor_rng
+                )
+                # JA policy returns 5 values, standard returns 4
+                if use_ja:
+                    act_0, val_0, pi_0, new_ego_hstate, ego_attn_map = ego_output
+                else:
+                    act_0, val_0, pi_0, new_ego_hstate = ego_output
+
+                logp_0 = pi_0.log_prob(act_0)
+
+                act_0 = act_0.squeeze()
+                logp_0 = logp_0.squeeze()
+                val_0 = val_0.squeeze()
+
+                # Agent_1 (partner) action using the AgentPopulation interface
+                act_1, new_partner_hstate = partner_population.get_actions(
+                    partner_params,
+                    updated_partner_indices,
+                    prev_obs["agent_1"].reshape(config["NUM_CONTROLLED_ACTORS"], 1, -1),
+                    prev_done["agent_1"].reshape(config["NUM_CONTROLLED_ACTORS"], 1, -1),
+                    avail_actions_1,
+                    partner_hstate,
+                    partner_rng,
+                    env_state=env_state,
+                    aux_obs=None
+                )
+                act_1 = act_1.squeeze()
+
+                # Combine actions into the env format
+                combined_actions = jnp.concatenate([act_0, act_1], axis=0)  # shape (2*num_envs,)
+                env_act = unbatchify(combined_actions, env.agents, config["NUM_ENVS"], num_agents)
+                env_act = {k: v.flatten() for k, v in env_act.items()}
+
+                # Step env
+                step_rngs = jax.random.split(step_rng, config["NUM_ENVS"])
+                obs_next, env_state_next, reward, done_next, info = jax.vmap(env.step, in_axes=(0,0,0))(
+                    step_rngs, env_state, env_act
+                )
+                # note that num_actors = num_envs * num_agents
+                info_0 = jax.tree.map(lambda x: x[:, 0], info)
+
+                # --- Joint Attention intrinsic reward ---
+                if use_ja:
+                    # Extract partner's position and facing direction from env state
+                    # State nesting: LogEnvState -> WrappedEnvState -> OvercookedState
+                    overcooked_state = env_state_next.env_state.env_state
+                    partner_pos = overcooked_state.agent_pos[:, 1, :]      # (NUM_ENVS, 2)
+                    partner_dir = overcooked_state.agent_dir_idx[:, 1]     # (NUM_ENVS,)
+
+                    # Compute inferred partner attention from (pos, dir)
+                    a_partner = jax.vmap(
+                        lambda p, d: inferred_attention(p, d, ja_obs_height, ja_obs_width)
+                    )(partner_pos, partner_dir)  # (NUM_ENVS, H, W)
+
+                    # Ego attention: squeeze the time dim (seq_len=1), shape -> (NUM_ENVS, H, W)
+                    a_ego = ego_attn_map.squeeze(0)
+
+                    # JA reward = -JSD(ego_attention, partner_inferred_attention)
+                    r_ja = -jsd_divergence(a_ego, a_partner)  # (NUM_ENVS,)
+                    r_ja = jax.lax.stop_gradient(r_ja)
+
+                    # Beta curriculum: scale up from 0 over warmup period
+                    # update_steps is available in the outer _update_step scope
+                    ego_reward = reward["agent_0"] + ja_beta * r_ja
+                else:
+                    ego_reward = reward["agent_0"]
+
+                # Store agent_0 data in transition
+                transition = Transition(
+                    done=done_next["agent_0"],
+                    action=act_0,
+                    value=val_0,
+                    reward=ego_reward,
+                    log_prob=logp_0,
+                    obs=prev_obs["agent_0"],
+                    info=info_0,
+                    avail_actions=avail_actions_0
+                )
+                new_runner_state = (train_state, env_state_next, obs_next, done_next,
+                                    new_ego_hstate, new_partner_hstate, updated_partner_indices, ja_beta, rng)
+                return new_runner_state, transition
+
+            def _calculate_gae(traj_batch, last_val):
+                def _get_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done, value, reward = (
+                        transition.done,
+                        transition.value,
+                        transition.reward,
+                    )
+                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+
+                _, advantages = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(last_val), last_val),
+                    traj_batch,
+                    reverse=True,
+                    unroll=16,
+                )
+                
+                return advantages, advantages + traj_batch.value
+
+            def _update_minbatch(train_state, batch_info):
+                init_ego_hstate, traj_batch, advantages, returns = batch_info
+                def _loss_fn(params, init_ego_hstate, traj_batch, gae, target_v):
+                    # JA policy returns 5 values (extra attn_map); discard extras beyond value, pi
+                    policy_out = ego_policy.get_action_value_policy(
+                        params=params,
+                        obs=traj_batch.obs,
+                        done=traj_batch.done,
+                        avail_actions=traj_batch.avail_actions,
+                        hstate=init_ego_hstate,
+                        rng=jax.random.PRNGKey(0) # only used for action sampling, which is unused here
+                    )
+                    # Unpack: action(0), value(1), pi(2), hstate(3), [attn_map(4) if JA]
+                    value = policy_out[1]
+                    pi = policy_out[2]
+                    log_prob = pi.log_prob(traj_batch.action)
+
+                    # Value loss
+                    value_pred_clipped = traj_batch.value + (
+                        value - traj_batch.value
+                        ).clip(
+                        -config["CLIP_EPS"], config["CLIP_EPS"])
+                    value_losses = jnp.square(value - target_v)
+                    value_losses_clipped = jnp.square(value_pred_clipped - target_v)
+                    value_loss = (
+                        jnp.maximum(value_losses, value_losses_clipped).mean()
+                    )
+
+                    # Policy gradient loss
+                    ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                    gae_norm = (gae - gae.mean()) / (gae.std() + 1e-8)
+                    pg_loss_1 = ratio * gae_norm
+                    pg_loss_2 = jnp.clip(
+                        ratio, 
+                        1.0 - config["CLIP_EPS"], 
+                        1.0 + config["CLIP_EPS"]) * gae_norm
+                    pg_loss = -jnp.mean(jnp.minimum(pg_loss_1, pg_loss_2))
+
+                    # Entropy
+                    entropy = jnp.mean(pi.entropy())
+
+                    total_loss = pg_loss + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy
+                    return total_loss, (value_loss, pg_loss, entropy)
+
+                grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                (loss_val, aux_vals), grads = grad_fn(
+                    train_state.params, init_ego_hstate, traj_batch, advantages, returns)
+                train_state = train_state.apply_gradients(grads=grads)
+                
+                # compute average grad norm
+                grad_l2_norms = jax.tree.map(lambda g: jnp.linalg.norm(g.astype(jnp.float32)), grads)
+                sum_of_grad_norms = jax.tree.reduce(lambda x, y: x + y, grad_l2_norms)
+                n_elements = len(jax.tree.leaves(grad_l2_norms))
+                avg_grad_norm = sum_of_grad_norms / n_elements
+                
+                return train_state, (loss_val, aux_vals, avg_grad_norm)
+
+            def _update_epoch(update_state, unused):
+                train_state, init_ego_hstate, traj_batch, advantages, targets, rng = update_state
+                rng, perm_rng = jax.random.split(rng)
+                minibatches = _create_minibatches(traj_batch, advantages, targets, init_ego_hstate, config["NUM_CONTROLLED_ACTORS"], config["NUM_MINIBATCHES"], perm_rng)
+                train_state, losses_and_grads = jax.lax.scan(
+                    _update_minbatch, train_state, minibatches
+                )
+                update_state = (train_state, init_ego_hstate, traj_batch, advantages, targets, rng)
+                return update_state, losses_and_grads
+
+            def _update_step(update_runner_state, unused):
+                """
+                1. Collect rollouts
+                2. Compute advantage
+                3. PPO updates
+                """
+                (train_state, rng, update_steps) = update_runner_state
+
+                # JA beta curriculum: ramp from 0 to ja_beta_max over warmup
+                ja_beta = jnp.where(
+                    use_ja,
+                    jnp.minimum(ja_beta_max, ja_beta_max * update_steps / jnp.maximum(ja_warmup_steps, 1.0)),
+                    0.0,
+                )
+
+                # Init envs & partner indices
+                rng, reset_rng, p_rng = jax.random.split(rng, 3)
+                reset_rngs = jax.random.split(reset_rng, config["NUM_ENVS"])
+                init_obs, init_env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rngs)
+                init_done = {k: jnp.zeros((config["NUM_ENVS"]), dtype=bool) for k in env.agents + ["__all__"]}
+                new_partner_indices = partner_population.sample_agent_indices(config["NUM_UNCONTROLLED_ACTORS"], p_rng)
+
+                # 1) rollout
+                runner_state = (train_state, init_env_state, init_obs, init_done, init_ego_hstate, init_partner_hstate, new_partner_indices, ja_beta, rng)
+
+                runner_state, traj_batch = jax.lax.scan(
+                    _env_step, runner_state, None, config["ROLLOUT_LENGTH"])
+                (train_state, env_state, obs, done, ego_hstate, partner_hstate, partner_indices, _, rng) = runner_state
+
+                # 2) advantage
+                # Get available actions for agent 0 from environment state
+                avail_actions_0 = jax.vmap(env.get_avail_actions)(env_state.env_state)["agent_0"].astype(jnp.float32)
+                                
+                # Get final value estimate for completed trajectory
+                last_val_out = ego_policy.get_action_value_policy(
+                    params=train_state.params,
+                    obs=obs["agent_0"].reshape(1, config["NUM_CONTROLLED_ACTORS"], -1),
+                    done=done["agent_0"].reshape(1, config["NUM_CONTROLLED_ACTORS"]),
+                    avail_actions=jax.lax.stop_gradient(avail_actions_0),
+                    hstate=ego_hstate,
+                    rng=jax.random.PRNGKey(0)  # Dummy key since we're just extracting the value
+                )
+                last_val = last_val_out[1]  # index 1 = value, works for both 4-tuple and 5-tuple
+                last_val = last_val.squeeze()
+                advantages, targets = _calculate_gae(traj_batch, last_val)
+
+                # 3) PPO update
+                update_state = (
+                    train_state,
+                    init_ego_hstate, # shape is (num_controlled_actors, gru_hidden_dim) with all-0s value
+                    traj_batch, # obs has shape (rollout_len, num_controlled_actors, -1)
+                    advantages,
+                    targets,
+                    rng
+                )
+                update_state, losses_and_grads = jax.lax.scan(
+                    _update_epoch, update_state, None, config["UPDATE_EPOCHS"])
+                train_state = update_state[0]
+                _, loss_terms, avg_grad_norm = losses_and_grads
+                
+                metric = traj_batch.info
+                metric["update_steps"] = update_steps
+                metric["actor_loss"] = loss_terms[1]
+                metric["value_loss"] = loss_terms[0]
+                metric["entropy_loss"] = loss_terms[2]
+                metric["avg_grad_norm"] = avg_grad_norm
+                new_runner_state = (train_state, rng, update_steps + 1)
+                return (new_runner_state, metric)
+
+            # PPO Update and Checkpoint saving
+            ckpt_and_eval_interval = config["NUM_UPDATES"] // max(1, config["NUM_CHECKPOINTS"] - 1)  # -1 because we store a ckpt at the last update
+            num_ckpts = config["NUM_CHECKPOINTS"]
+
+            # Build a PyTree that holds parameters for all FCP checkpoints
+            def init_ckpt_array(params_pytree):
+                return jax.tree.map(
+                    lambda x: jnp.zeros((num_ckpts,) + x.shape, x.dtype), 
+                    params_pytree)
+
+            max_episode_steps = config["ROLLOUT_LENGTH"]
+            
+            def _update_step_with_ckpt(state_with_ckpt, unused):
+                (update_state, checkpoint_array, ckpt_idx, init_eval_last_info) = state_with_ckpt
+
+                # Single PPO update
+                new_update_state, metric = _update_step(
+                    update_state,
+                    None
+                )
+                (train_state, rng, update_steps) = new_update_state
+
+                # update steps is 1-indexed because it was incremented at the end of the update step
+                to_store = jnp.logical_or(jnp.equal(jnp.mod(update_steps-1, ckpt_and_eval_interval), 0),
+                                        jnp.equal(update_steps, config["NUM_UPDATES"]))
+
+
+                def store_and_eval_ckpt(args):
+                    ckpt_arr, cidx, rng, prev_eval_ret_info = args
+                    new_ckpt_arr = jax.tree.map(
+                        lambda c_arr, p: c_arr.at[cidx].set(p),
+                        ckpt_arr, train_state.params
+                    )
+
+                    eval_partner_indices = jnp.arange(num_total_partners)
+                    gathered_params = partner_population.gather_agent_params(partner_params, eval_partner_indices)
+                    
+                    rng, eval_rng = jax.random.split(rng)
+                    eval_eps_last_infos = jax.vmap(lambda x: run_episodes(
+                        eval_rng, env, agent_0_param=train_state.params, agent_0_policy=ego_policy, 
+                        agent_1_param=x, agent_1_policy=partner_population.policy_cls, 
+                        max_episode_steps=max_episode_steps, 
+                        num_eps=config["NUM_EVAL_EPISODES"]))(gathered_params)
+                    return (new_ckpt_arr, cidx + 1, rng, eval_eps_last_infos)
+                
+                def skip_ckpt(args):
+                    return args
+
+                (checkpoint_array, ckpt_idx, rng, eval_last_infos) = jax.lax.cond(
+                    to_store, store_and_eval_ckpt, skip_ckpt, (checkpoint_array, ckpt_idx, rng, init_eval_last_info)
+                )
+
+                metric["eval_ep_last_info"] = eval_last_infos
+                return ((train_state, rng, update_steps),
+                         checkpoint_array, ckpt_idx, eval_last_infos), metric
+
+            checkpoint_array = init_ckpt_array(train_state.params)
+            ckpt_idx = 0
+
+            rng, rng_eval, rng_train = jax.random.split(rng, 3)
+            # Init eval return infos
+            eval_partner_indices = jnp.arange(num_total_partners)
+            gathered_params = partner_population.gather_agent_params(partner_params, eval_partner_indices)
+            eval_eps_last_infos = jax.vmap(lambda x: run_episodes(
+                        rng_eval, env, 
+                        agent_0_param=train_state.params, agent_0_policy=ego_policy, 
+                        agent_1_param=x, agent_1_policy=partner_population.policy_cls, 
+                        max_episode_steps=max_episode_steps, 
+                        num_eps=config["NUM_EVAL_EPISODES"]))(gathered_params)
+
+            # initial runner state for scanning
+            update_steps = 0
+            rng_train, partner_rng = jax.random.split(rng_train)
+
+            update_runner_state = (train_state, rng_train, update_steps)
+            state_with_ckpt = (update_runner_state, checkpoint_array, ckpt_idx, eval_eps_last_infos)
+            
+            state_with_ckpt, metrics = jax.lax.scan(
+                _update_step_with_ckpt,
+                state_with_ckpt,
+                xs=None,
+                length=config["NUM_UPDATES"]
+            )
+            (final_runner_state, checkpoint_array, final_ckpt_idx, eval_eps_last_infos) = state_with_ckpt
+            out = {
+                "final_params": final_runner_state[0].params,
+                "metrics": metrics,  # shape (NUM_UPDATES, ...)
+                "checkpoints": checkpoint_array,
+            }
+            return out
+        return train
+
+    # ------------------------------
+    # Actually run the PPO training
+    # ------------------------------
+    rngs = jax.random.split(train_rng, n_ego_train_seeds)
+    train_fn = jax.jit(jax.vmap(make_ppo_train(config)))
+    out = train_fn(rngs)    
+    return out
+
+def run_ego_training(config, wandb_logger):
+    '''Run ego agent training against the population of partner agents.
+    
+    Args:
+        config: dict, config for the training
+    '''
+    algorithm_config = dict(config["algorithm"])
+
+    # Create only one environment instance
+    env = make_env(algorithm_config["ENV_NAME"], algorithm_config["ENV_KWARGS"])
+    env = LogWrapper(env)
+
+    rng = jax.random.PRNGKey(algorithm_config["TRAIN_SEED"])
+    rng, init_partner_rng, init_ego_rng, train_rng = jax.random.split(rng, 4)
+    
+
+    partner_agent_config = dict(algorithm_config["partner_agent"])
+    assert len(partner_agent_config) == 1, "Only supports training against one type of partner agent."
+    
+    partner0_name = list(partner_agent_config.keys())[0]
+    partner0_agent_config = list(partner_agent_config.values())[0]
+    partner_policy, partner_params, init_partner_params, idx_labels = initialize_rl_agent_from_config(
+        partner0_agent_config, partner0_name, env, init_partner_rng)
+
+    flattened_partner_params = jax.tree.map(lambda x, y: x.reshape((-1,) + y.shape), partner_params, init_partner_params)        
+    pop_size = jax.tree.leaves(flattened_partner_params)[0].shape[0]
+
+    # Create partner population
+    partner_population = AgentPopulation(
+        pop_size=pop_size,
+        policy_cls=partner_policy
+    )
+    
+    # Initialize ego agent
+    ego_policy, init_ego_params = initialize_ego_agent(algorithm_config, env, init_ego_rng)
+
+    # Populate JA grid dimensions from environment (needed when USE_JA=True)
+    if algorithm_config.get("USE_JA", False):
+        inner_env = env._env if hasattr(env, '_env') else env
+        inner_env = inner_env.env if hasattr(inner_env, 'env') else inner_env
+        algorithm_config["JA_OBS_HEIGHT"] = inner_env.obs_shape[1]
+        algorithm_config["JA_OBS_WIDTH"] = inner_env.obs_shape[0]
+
+    log.info("Starting ego agent training...")
+    start_time = time.time()
+    
+    # Run the training
+    out = train_ppo_ego_agent(
+        config=algorithm_config,
+        env=env,
+        train_rng=train_rng,
+        ego_policy=ego_policy,
+        init_ego_params=init_ego_params,
+        n_ego_train_seeds=algorithm_config["NUM_EGO_TRAIN_SEEDS"],
+        partner_population=partner_population,
+        partner_params=flattened_partner_params
+    )
+    
+    log.info(f"Training completed in {time.time() - start_time:.2f} seconds")
+    
+    # process and log metrics
+    metric_names = get_metric_names(config["ENV_NAME"])
+    log_metrics(config, out, wandb_logger, metric_names)
+    
+    return out["final_params"], ego_policy, init_ego_params
+
+def log_metrics(config, train_out, logger, metric_names: tuple):
+    """Process training metrics and log them using the provided logger.
+    
+    Args:
+        training_logs: dict, the logs from training
+        logger: Logger, instance to log metrics
+        metric_names: tuple, names of metrics to extract from training logs
+    """
+    train_metrics = train_out["metrics"]
+
+    #### Extract train metrics ####
+    train_stats = get_stats(train_metrics, metric_names)
+    # each key in train_stats is a metric name, and the value is an array of shape (num_seeds, num_updates, 2)
+    # where the last dimension contains the mean and std of the metric
+    train_stats = {k: np.mean(np.array(v), axis=0) for k, v in train_stats.items()}
+    
+    all_ego_value_losses = np.asarray(train_metrics["value_loss"]) # shape (n_ego_train_seeds, num_updates, num_partners, num_minibatches)
+    all_ego_actor_losses = np.asarray(train_metrics["actor_loss"]) # shape (n_ego_train_seeds, num_updates, num_partners, num_minibatches)
+    all_ego_entropy_losses = np.asarray(train_metrics["entropy_loss"]) # shape (n_ego_train_seeds, num_updates, num_partners, num_minibatches)
+    all_ego_grad_norms = np.asarray(train_metrics["avg_grad_norm"]) # shape (n_ego_train_seeds, num_updates, num_partners, num_minibatches)
+    # Process eval return metrics - average across ego seeds, eval episodes,  training partners 
+    # and num_agents per game for each checkpoint
+    all_ego_returns = np.asarray(train_metrics["eval_ep_last_info"]["returned_episode_returns"]) # shape (n_ego_train_seeds, num_updates, num_partners, num_eval_episodes, nuM_agents_per_game)
+    average_ego_rets_per_iter = np.mean(all_ego_returns, axis=(0, 2, 3, 4))
+
+    # Process loss metrics - average across ego seeds, partners and minibatches dims
+    # Loss metrics shape should be (n_ego_train_seeds, num_updates, ...)
+    average_ego_value_losses = np.mean(all_ego_value_losses, axis=(0, 2, 3))
+    average_ego_actor_losses = np.mean(all_ego_actor_losses, axis=(0, 2, 3))
+    average_ego_entropy_losses = np.mean(all_ego_entropy_losses, axis=(0, 2, 3))
+    average_ego_grad_norms = np.mean(all_ego_grad_norms, axis=(0, 2, 3))
+
+    # Log metrics for each update step
+    num_updates = len(average_ego_value_losses)
+    for step in range(num_updates):
+        for stat_name, stat_data in train_stats.items():
+            # second dimension contains the mean and std of the metric
+            stat_mean = stat_data[step, 0]
+            logger.log_item(f"Train/Ego_{stat_name}", stat_mean, train_step=step, commit=True)
+
+        logger.log_item("Eval/EgoReturn", average_ego_rets_per_iter[step], train_step=step, commit=True)
+        logger.log_item("Train/EgoValueLoss", average_ego_value_losses[step], train_step=step, commit=True)
+        logger.log_item("Train/EgoActorLoss", average_ego_actor_losses[step], train_step=step, commit=True)
+        logger.log_item("Train/EgoEntropyLoss", average_ego_entropy_losses[step], train_step=step, commit=True)
+        logger.log_item("Train/EgoGradNorm", average_ego_grad_norms[step], train_step=step, commit=True)
+        logger.commit()
+    
+    # Saving artifacts
+    savedir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+
+    out_savepath = save_train_run(train_out, savedir, savename="ego_train_run")
+    if config["logger"]["log_train_out"]:
+        logger.log_artifact(name="ego_train_run", path=out_savepath, type_name="train_run")
+        # Cleanup locally logged out file
+    if not config["local_logger"]["save_train_out"]:
+        shutil.rmtree(out_savepath)

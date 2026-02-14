@@ -1,0 +1,23 @@
+training_state
+figures/
+figures/*
+notebooks/
+notebooks/*
+
+results*/
+results*/*
+eval_teammates/
+eval_teammates/*
+.vscode/
+.vscode/*
+
+# pycache
+**/__pycache__/
+**/*.pyc
+
+# Python packaging artifacts
+*.egg-info/
+__pycache__/
+*.pyc
+dist/
+build/
